@@ -14,8 +14,8 @@
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
                      bool   no_alloc,
-                ggml_type   type_k,
-                ggml_type   type_v,
+      llama_kv_cache_type   type_k,
+      llama_kv_cache_type   type_v,
                      bool   v_trans,
                      bool   offload,
                      bool   swa_full,
@@ -35,8 +35,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
                      bool   no_alloc,
       const llama_hparams & hparams,
-                ggml_type   type_k,
-                ggml_type   type_v,
+      llama_kv_cache_type   type_k,
+      llama_kv_cache_type   type_v,
                      bool   v_trans,
                      bool   offload,
                      bool   swa_full,
@@ -246,6 +246,17 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_full() {
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
+}
+
+bool llama_kv_cache_iswa::try_lazy_quantize(llama_context * lctx) {
+    const bool base = (!lctx || kv_base->get_needs_lazy_quant()) && kv_base->try_lazy_quantize(lctx);
+    const bool swa  = (!lctx || kv_swa ->get_needs_lazy_quant()) && kv_swa ->try_lazy_quantize(lctx);
+
+    return base || swa;
+}
+
+bool llama_kv_cache_iswa::get_has_lazy_quant() const {
+    return kv_base->get_has_lazy_quant() || kv_swa->get_has_lazy_quant();
 }
 
 bool llama_kv_cache_iswa::get_can_shift() const {

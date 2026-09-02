@@ -1226,8 +1226,8 @@ size_t llama_dsv4_comp_state::total_size() const {
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         const llama_model & model,
                      bool   no_alloc,
-                ggml_type   type_k,
-                ggml_type   type_v,
+      llama_kv_cache_type   type_k,
+      llama_kv_cache_type   type_v,
                      bool   v_trans,
                      bool   offload,
                      bool   swa_full,
@@ -1567,6 +1567,19 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, 
             std::move(csa_state->sc_info),
             std::move(hca_state->sc_info),
             std::move(lid_state->sc_info));
+}
+
+bool llama_kv_cache_dsv4::try_lazy_quantize(llama_context * lctx) {
+    const bool raw = kv_raw->try_lazy_quantize(lctx);
+    const bool csa = kv_csa->try_lazy_quantize(lctx);
+    const bool hca = kv_hca->try_lazy_quantize(lctx);
+    const bool lid = kv_lid->try_lazy_quantize(lctx);
+
+    return raw || csa || hca || lid;
+}
+
+bool llama_kv_cache_dsv4::get_has_lazy_quant() const {
+    return kv_raw->get_has_lazy_quant() || kv_csa->get_has_lazy_quant() || kv_hca->get_has_lazy_quant() || kv_lid->get_has_lazy_quant();
 }
 
 bool llama_kv_cache_dsv4::get_can_shift() const {

@@ -16,8 +16,8 @@ public:
     llama_kv_cache_iswa(
             const llama_model & model,
                          bool   no_alloc,
-                    ggml_type   type_k,
-                    ggml_type   type_v,
+          llama_kv_cache_type   type_k,
+          llama_kv_cache_type   type_v,
                          bool   v_trans,
                          bool   offload,
                          bool   swa_full,
@@ -34,8 +34,8 @@ public:
             const llama_model & model,
                          bool   no_alloc,
           const llama_hparams & hparams,
-                    ggml_type   type_k,
-                    ggml_type   type_v,
+          llama_kv_cache_type   type_k,
+          llama_kv_cache_type   type_v,
                          bool   v_trans,
                          bool   offload,
                          bool   swa_full,
@@ -62,6 +62,10 @@ public:
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+
+    bool try_lazy_quantize(llama_context * lctx) override;
+
+    bool get_has_lazy_quant() const override;
 
     bool get_can_shift() const override;
 

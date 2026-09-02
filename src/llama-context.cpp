@@ -234,6 +234,16 @@ llama_context::llama_context(
         }
 
         cparams.ctx_other = params.ctx_other;
+
+        auto * ctx_other = cparams.ctx_other;
+        if (ctx_other->memory && ctx_other->memory->get_has_lazy_quant()) {
+            LLAMA_LOG_WARN("%s: converting target KV cache to its final format before sharing it with the assistant\n", __func__);
+            ctx_other->synchronize();
+            ctx_other->memory_update(false);
+            ctx_other->sched_need_reserve = true;
+            ctx_other->memory->try_lazy_quantize(nullptr);
+            ctx_other->sched_reserve();
+        }
     }
 
     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
@@ -531,8 +541,8 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
+            /*.type_k    =*/ { params.type_k_initial, params.type_k },
+            /*.type_v    =*/ { params.type_v_initial, params.type_v },
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
@@ -2276,6 +2286,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                             continue;
                         }
+                    }
+
+                    if (memory->try_lazy_quantize(this)) {
+                        sched_need_reserve = true;
+                        sched_reserve();
+
+                        LLAMA_LOG_DEBUG("%s: retrying batch size %d after lazy KV cache quantization\n", __func__, balloc->get_n_tokens());
+
+                        continue;
                     }
 
                     LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
@@ -4106,6 +4125,8 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     if (memory) {
         LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
 
+        // A partial or failed restore can change only part of the cache layout.
+        sched_need_reserve = sched_need_reserve || memory->get_has_lazy_quant();
         memory->state_read(io);
     }
 
@@ -4122,6 +4143,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
+        sched_need_reserve = sched_need_reserve || memory->get_has_lazy_quant();
         memory->state_read(io, seq_id, flags);
     }
 
@@ -4471,6 +4493,9 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.type_k_initial              =*/ GGML_TYPE_COUNT,
+        /*.type_v_initial              =*/ GGML_TYPE_COUNT,
+        /*.kv_lazy                     =*/ false,
     };
 
     return result;
@@ -4513,8 +4538,23 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+    if (!params.kv_lazy || params.type_k_initial == GGML_TYPE_COUNT) {
+        params.type_k_initial = params.type_k;
+    }
+    if (!params.kv_lazy || params.type_v_initial == GGML_TYPE_COUNT) {
+        params.type_v_initial = params.type_v;
+    }
+    const bool lazy_k = params.type_k_initial != params.type_k;
+    const bool lazy_v = params.type_v_initial != params.type_v;
+    if ((lazy_k && !llama_kv_cache_type::can_convert(params.type_k_initial, params.type_k)) ||
+        (lazy_v && !llama_kv_cache_type::can_convert(params.type_v_initial, params.type_v))) {
+        LLAMA_LOG_ERROR("%s: lazy KV conversion requires a smaller cache type and does not support FP8 transitions\n", __func__);
+        return nullptr;
+    }
+
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) &&
+            (params.type_k != params.type_v || params.type_k_initial != params.type_v_initial)) {
+        LLAMA_LOG_ERROR("%s: model does not support different K and V cache types in either format\n", __func__);
         return nullptr;
     }
 
@@ -4557,13 +4597,13 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+    if ((ggml_is_quantized(params.type_v) || lazy_k || lazy_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for the requested KV cache formats\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         }
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
+            LLAMA_LOG_ERROR("%s: the requested KV cache formats require flash_attn to be enabled\n", __func__);
             return nullptr;
         }
     }

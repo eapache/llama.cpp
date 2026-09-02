@@ -15,8 +15,8 @@
 llama_kv_cache_dsa::llama_kv_cache_dsa(
         const llama_model & model,
                      bool   no_alloc,
-                ggml_type   type_k,
-                ggml_type   type_v,
+      llama_kv_cache_type   type_k,
+      llama_kv_cache_type   type_v,
                      bool   v_trans,
                      bool   offload,
                      bool   unified,
@@ -156,6 +156,21 @@ llama_memory_context_ptr llama_kv_cache_dsa::init_full() {
 
 llama_memory_context_ptr llama_kv_cache_dsa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_dsa_context>(this, lctx, optimize);
+}
+
+bool llama_kv_cache_dsa::try_lazy_quantize(llama_context * lctx) {
+    const bool mla = kv_mla->try_lazy_quantize(lctx);
+    const bool lid = kv_lid->try_lazy_quantize(lctx);
+
+    return mla || lid;
+}
+
+bool llama_kv_cache_dsa::get_has_lazy_quant() const {
+    return kv_mla->get_has_lazy_quant() || kv_lid->get_has_lazy_quant();
+}
+
+bool llama_kv_cache_dsa::get_needs_lazy_quant() const {
+    return kv_mla->get_needs_lazy_quant() || kv_lid->get_needs_lazy_quant();
 }
 
 bool llama_kv_cache_dsa::get_can_shift() const {

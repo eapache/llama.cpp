@@ -436,6 +436,10 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        enum ggml_type type_k_initial; // initial K type before lazy conversion to type_k, GGML_TYPE_COUNT for fixed
+        enum ggml_type type_v_initial; // initial V type before lazy conversion to type_v, GGML_TYPE_COUNT for fixed
+        bool kv_lazy; // enable the initial cache types [EXPERIMENTAL]
     };
 
     struct llama_model_tensor_override {

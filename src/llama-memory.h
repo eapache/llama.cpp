@@ -15,10 +15,20 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+struct llama_kv_cache_type {
+    ggml_type initial;
+    ggml_type target;
+
+    llama_kv_cache_type(ggml_type type) : initial(type), target(type) {}
+    llama_kv_cache_type(ggml_type initial, ggml_type target) : initial(initial), target(target) {}
+
+    static bool can_convert(int32_t src, ggml_type dst);
+};
+
 struct llama_memory_params {
     // kv cache
-    ggml_type type_k;
-    ggml_type type_v;
+    llama_kv_cache_type type_k;
+    llama_kv_cache_type type_v;
 
     // use full-size SWA cache
     bool swa_full;
@@ -128,6 +138,15 @@ struct llama_memory_i {
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
+
+    virtual bool try_lazy_quantize(llama_context * lctx) {
+        GGML_UNUSED(lctx);
+        return false;
+    }
+
+    virtual bool get_has_lazy_quant() const {
+        return false;
+    }
 
     // getters
     virtual bool get_can_shift() const = 0;
