@@ -2647,32 +2647,6 @@ private:
     std::vector<write_info> winfos;
 };
 
-static void llama_io_tensor_set(ggml_tensor * tensor, const uint8_t * data, size_t offset, size_t size, bool quantize) {
-    if (!quantize) {
-        ggml_backend_tensor_set(tensor, data, offset, size);
-        return;
-    }
-
-    GGML_ASSERT(tensor->type == GGML_TYPE_Q8_0);
-    const size_t n_per_row = tensor->ne[0];
-    const size_t src_row_size = ggml_row_size(GGML_TYPE_F16, n_per_row);
-    const size_t dst_row_size = ggml_row_size(tensor->type, n_per_row);
-    GGML_ASSERT(offset % src_row_size == 0 && size % src_row_size == 0);
-
-    const size_t chunk_rows = std::min<size_t>(256, size/src_row_size);
-    std::vector<ggml_fp16_t> data_f16(chunk_rows*n_per_row);
-    std::vector<float>       data_f32(chunk_rows*n_per_row);
-    std::vector<uint8_t>     data_q8(chunk_rows*dst_row_size);
-
-    for (size_t pos = 0; pos < size; pos += chunk_rows*src_row_size) {
-        const size_t n_rows = std::min(chunk_rows, (size - pos)/src_row_size);
-        memcpy(data_f16.data(), data + pos, n_rows*src_row_size);
-        ggml_fp16_to_fp32_row(data_f16.data(), data_f32.data(), n_rows*n_per_row);
-        const size_t nbytes = ggml_quantize_chunk(GGML_TYPE_Q8_0, data_f32.data(), data_q8.data(), 0, n_rows, n_per_row, nullptr);
-        ggml_backend_tensor_set(tensor, data_q8.data(), (offset + pos)/src_row_size*dst_row_size, nbytes);
-    }
-}
-
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
@@ -2680,7 +2654,7 @@ public:
     ~llama_io_read_host() {
         // flush the reads
         for (const auto & rinfo : rinfos) {
-            llama_io_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size, rinfo.quantize);
+            converter.set_tensor(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size, rinfo.conversion);
         }
     }
 
@@ -2694,13 +2668,13 @@ public:
         buf_size -= size;
     }
 
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size, bool quantize) override {
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size, llama_io_tensor_conversion conversion) override {
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
 
         // save for later during destruction
-        rinfos.push_back({tensor, ptr, size, offset, quantize});
+        rinfos.push_back({tensor, ptr, size, offset, conversion});
 
         ptr += size;
         size_read += size;
@@ -2712,6 +2686,8 @@ public:
     }
 
 private:
+    llama_io_tensor_converter converter;
+
     const uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_read = 0;
@@ -2721,7 +2697,7 @@ private:
         const uint8_t * ptr;
         size_t size;
         size_t offset;
-        bool quantize;
+        llama_io_tensor_conversion conversion;
     };
     std::vector<read_info> rinfos;
 };
@@ -2760,10 +2736,10 @@ public:
         size_read += size;
     }
 
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size, bool quantize) override {
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size, llama_io_tensor_conversion conversion) override {
         temp_buffer.resize(size);
         read(temp_buffer.data(), size);
-        llama_io_tensor_set(tensor, temp_buffer.data(), offset, size, quantize);
+        converter.set_tensor(tensor, temp_buffer.data(), offset, size, conversion);
     }
 
     size_t n_bytes() override {
@@ -2771,6 +2747,8 @@ public:
     }
 
 private:
+    llama_io_tensor_converter converter;
+
     llama_file * file;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
@@ -2914,7 +2892,7 @@ public:
     }
 
     ~llama_io_read_device() {
-        if (std::any_of(rinfos.begin(), rinfos.end(), [](const read_info & rinfo) { return rinfo.quantize; })) {
+        if (std::any_of(rinfos.begin(), rinfos.end(), [](const read_info & rinfo) { return rinfo.conversion.type_src != GGML_TYPE_COUNT; })) {
             // Conversion uses the saved byte stream, independent of save/restore fragmentation.
             std::map<ggml_backend_buffer_type_t, std::pair<size_t, size_t>> cursors;
             std::vector<uint8_t> data;
@@ -2922,7 +2900,9 @@ public:
                 const auto buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
                 const auto & tensors = mbufs.at(buft).cpy;
                 auto & cursor = cursors[buft];
-                const size_t row_size = ggml_row_size(rinfo.quantize ? GGML_TYPE_F16 : rinfo.tensor->type, rinfo.tensor->ne[0]);
+                const ggml_type type_src = rinfo.conversion.type_src != GGML_TYPE_COUNT ? rinfo.conversion.type_src : rinfo.tensor->type;
+                const size_t row_size = ggml_row_size(type_src, rinfo.tensor->ne[0]);
+                const size_t dst_row_size = ggml_row_size(rinfo.tensor->type, rinfo.tensor->ne[0]);
                 for (size_t pos = 0; pos < rinfo.size;) {
                     const size_t size = std::min(rinfo.size - pos, 256*row_size);
                     data.resize(size);
@@ -2938,7 +2918,7 @@ public:
                             cursor.second = 0;
                         }
                     }
-                    llama_io_tensor_set(rinfo.tensor, data.data(), rinfo.offset + pos, size, rinfo.quantize);
+                    converter.set_tensor(rinfo.tensor, data.data(), rinfo.offset + pos/row_size*dst_row_size, size, rinfo.conversion);
                     pos += size;
                 }
             }
@@ -3085,9 +3065,9 @@ public:
         buf_size -= size;
     }
 
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size, bool quantize) override {
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size, llama_io_tensor_conversion conversion) override {
         // save for later during destruction
-        rinfos.push_back({tensor, ptr, size, offset, quantize});
+        rinfos.push_back({tensor, ptr, size, offset, conversion});
     }
 
     size_t n_bytes() override {
@@ -3095,6 +3075,8 @@ public:
     }
 
 private:
+    llama_io_tensor_converter converter;
+
     const uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_read = 0;
@@ -3104,7 +3086,7 @@ private:
         const uint8_t * ptr;
         size_t size;
         size_t offset;
-        bool quantize;
+        llama_io_tensor_conversion conversion;
     };
     std::vector<read_info> rinfos;
 
@@ -3141,7 +3123,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     }
 }
 
-static constexpr uint32_t io_magic = 0xaf143cd8;
+static constexpr uint32_t io_magic = 0xaf143cd9;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
@@ -3351,6 +3333,9 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
+    const uint32_t version = LLAMA_SESSION_VERSION;
+    io.write(&version, sizeof(version));
+
     // write model info
     {
         LLAMA_LOG_DEBUG("%s: - writing model info\n", __func__);
@@ -3370,6 +3355,12 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+
+    uint32_t version;
+    io.read(&version, sizeof(version));
+    if (version != LLAMA_SESSION_VERSION) {
+        throw std::runtime_error("wrong state version");
+    }
 
     // read model info
     {

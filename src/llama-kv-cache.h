@@ -279,17 +279,20 @@ private:
     // required padding
     const uint32_t n_pad = 1;
 
-    uint32_t kv_size_target = 0;
-    bool lazy_quant = false;
-    bool lazy_quant_converted = false;
+    struct cache_format {
+        uint32_t size = 0;
+        ggml_type type_k = GGML_TYPE_F16;
+        ggml_type type_v = GGML_TYPE_F16;
+        uint32_t n_rot_k = 0;
+        uint32_t n_rot_v = 0;
+    };
+
+    cache_format current;
+    cache_format target;
     bool lazy_quant_pending = false;
 
     // SWA
     const uint32_t n_swa = 0;
-
-    // env: LLAMA_ATTN_ROT_DISABLE
-    bool attn_rot_k = false;
-    bool attn_rot_v = false;
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1

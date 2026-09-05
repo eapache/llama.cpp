@@ -12,8 +12,11 @@
 #include "../src/llama-model-saver.h"
 #include "../src/llama-context.h"
 #include "../src/llama-kv-cache-iswa.h"
+#include "../src/llama-io.h"
+#include "../src/llama-impl.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -809,6 +812,52 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     return all_ok ? 0 : 1;
 }
 
+static void test_kv_rotation(ggml_backend_dev_t dev) {
+    ggml_backend_ptr backend(dev ? ggml_backend_dev_init(dev, nullptr) : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    GGML_ASSERT(backend);
+    for (uint32_t nrot : {64u, 128u}) {
+        ggml_context_ptr ctx(ggml_init({ 8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true }));
+        auto * rot = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot, nrot);
+        auto * src = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot, 257);
+        auto * dst = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot, 257);
+        auto * ref = llama_mul_mat_hadamard(ctx.get(), src, rot);
+        auto * graph = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(graph, ref);
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+        GGML_ASSERT(buf);
+
+        std::vector<float> matrix(nrot*nrot);
+        const float scale = 1.0f/std::sqrt(float(nrot));
+        for (uint32_t i = 0; i < nrot; ++i) {
+            for (uint32_t j = 0; j < nrot; ++j) {
+                uint32_t bits = i & j;
+                float sign = scale;
+                while (bits) {
+                    sign = -sign;
+                    bits &= bits - 1;
+                }
+                matrix[i*nrot + j] = sign;
+            }
+        }
+        std::vector<float> input(ggml_nelements(src));
+        std::vector<ggml_fp16_t> input_f16(input.size());
+        for (size_t i = 0; i < input.size(); ++i) {
+            input_f16[i] = ggml_fp32_to_fp16(std::sin(float(i)));
+            input[i] = ggml_fp16_to_fp32(input_f16[i]);
+        }
+        ggml_backend_tensor_set(rot, matrix.data(), 0, ggml_nbytes(rot));
+        ggml_backend_tensor_set(src, input.data(), 0, ggml_nbytes(src));
+        GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+
+        llama_io_tensor_converter converter;
+        converter.set_tensor(dst, input_f16.data(), 0, input_f16.size()*sizeof(ggml_fp16_t), { GGML_TYPE_F16, nrot });
+        std::vector<float> expected(input.size()), actual(input.size());
+        ggml_backend_tensor_get(ref, expected.data(), 0, ggml_nbytes(ref));
+        ggml_backend_tensor_get(dst, actual.data(), 0, ggml_nbytes(dst));
+        GGML_ASSERT(nmse(expected, actual) < 1e-10);
+    }
+}
+
 static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
     auto gguf = get_gguf_ctx(arch, false);
     if (arch == LLM_ARCH_GEMMA4) {
@@ -826,7 +875,7 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
     GGML_ASSERT(model);
 
     std::vector<ggml_type> attention_types;
-    auto make_context = [&](uint32_t n_ctx = 512, bool swa_full = true, uint32_t n_seq_max = 2) {
+    auto make_context = [&](uint32_t n_ctx = 512, bool swa_full = true, uint32_t n_seq_max = 2, ggml_type type = GGML_TYPE_Q8_0) {
         auto p = llama_context_default_params();
         p.n_ctx = n_ctx;
         p.n_batch = 512;
@@ -835,7 +884,7 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
         p.kv_unified = true;
         p.swa_full = swa_full;
         p.n_threads = p.n_threads_batch = 2;
-        p.type_k = p.type_v = GGML_TYPE_Q8_0;
+        p.type_k = p.type_v = type;
         p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         p.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
             if (ask && t->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -874,6 +923,29 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
         }
     };
 
+    // Lazy F16 must match ordinary F16, including a pending context shift.
+    auto plain = make_context(512, true, 2, GGML_TYPE_F16);
+    auto lazy = make_context();
+    decode(plain.get(), 0, 16);
+    decode(lazy.get(), 0, 16);
+    GGML_ASSERT(save(plain.get()) == save(lazy.get()));
+    if (llama_memory_can_shift(plain->get_memory())) {
+        for (auto * c : { plain.get(), lazy.get() }) {
+            GGML_ASSERT(llama_memory_seq_rm(c->get_memory(), 0, 0, 4));
+            llama_memory_seq_add(c->get_memory(), 0, 4, -1, -4);
+            decode(c, 12, 1);
+        }
+        GGML_ASSERT(lazy->get_memory()->get_has_lazy_quant());
+        GGML_ASSERT(save(plain.get()) == save(lazy.get()));
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        std::vector<float> logits_plain(llama_get_logits(plain.get()), llama_get_logits(plain.get()) + n_vocab);
+        std::vector<float> logits_lazy(llama_get_logits(lazy.get()), llama_get_logits(lazy.get()) + n_vocab);
+        GGML_ASSERT(nmse(logits_plain, logits_lazy) < 1e-10);
+    }
+    restore(plain.get(), save(lazy.get()));
+    restore(lazy.get(), save(plain.get()));
+    GGML_ASSERT(save(plain.get()) == save(lazy.get()));
+
     // Pre-transition snapshots must restore into the expanded cache on both IO paths.
     auto ctx = make_context();
     GGML_ASSERT(ctx->get_memory()->get_has_lazy_quant());
@@ -896,6 +968,29 @@ static void test_lazy_kv(llm_arch arch, size_t seed, ggml_backend_dev_t dev) {
     }
     GGML_ASSERT(llama_state_set_data(ctx.get(), f16_full.data(), f16_full.size()) == f16_full.size());
     GGML_ASSERT(save(ctx.get()) == q8_host);
+
+    // Restore conversion depends on the formats, not on a prior lazy transition.
+    common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "0");
+    auto fixed = make_context();
+    common_set_env("LLAMA_KV_CACHE_LAZY_QUANT", "1");
+    GGML_ASSERT(!fixed->get_memory()->get_has_lazy_quant());
+    restore(fixed.get(), f16_host);
+    GGML_ASSERT(save(fixed.get()) == q8_host);
+
+    // Disk restore uses the same conversion as host and device snapshots.
+    const std::string state_file = "test-lazy-kv-" + std::string(llm_arch_name(arch)) + ".bin";
+    restore(lazy.get(), f16_host);
+    GGML_ASSERT(llama_state_seq_save_file(lazy.get(), state_file.c_str(), 0, nullptr, 0) > 0);
+    size_t n_tokens = 0;
+    GGML_ASSERT(llama_state_seq_load_file(ctx.get(), state_file.c_str(), 0, nullptr, 0, &n_tokens) > 0);
+    GGML_ASSERT(save(ctx.get()) == q8_host);
+    GGML_ASSERT(std::remove(state_file.c_str()) == 0);
+
+    // A matching type with a different rotation must be rejected.
+    common_set_env("LLAMA_ATTN_ROT_DISABLE", "1");
+    auto unrotated = make_context();
+    common_set_env("LLAMA_ATTN_ROT_DISABLE", "0");
+    GGML_ASSERT(llama_state_seq_set_data(unrotated.get(), q8_host.data(), q8_host.size(), 0) == 0);
 
     // The snapshot fits the final cache, but not the free space in the F16 cache.
     ctx = make_context();
@@ -1018,6 +1113,7 @@ int main(int argc, char ** argv) {
             if (!device.empty() && !dev) {
                 throw std::runtime_error("unknown device: " + device);
             }
+            test_kv_rotation(dev);
             for (auto test_arch : {LLM_ARCH_LLAMA, LLM_ARCH_GEMMA4}) {
                 if (arch == LLM_ARCH_UNKNOWN || arch == test_arch) {
                     test_lazy_kv(test_arch, seed, dev);
