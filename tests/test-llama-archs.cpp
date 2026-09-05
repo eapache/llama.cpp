@@ -9,6 +9,10 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include "../src/llama-context.h"
+#include "../src/llama-io.h"
+#include "../src/llama-impl.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -177,6 +181,9 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+#ifdef TEST_KV_CONVERSION
+    LOG("  --kv-conversion          Test KV cache state conversion\n");
+#endif
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1904,6 +1911,130 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+#ifdef TEST_KV_CONVERSION
+static void test_kv_rotation(ggml_backend_dev_t dev) {
+    ggml_backend_ptr backend(dev ? ggml_backend_dev_init(dev, nullptr) : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    GGML_ASSERT(backend);
+    for (uint32_t nrot : {64u, 128u}) {
+        ggml_context_ptr ctx(ggml_init({ 8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true }));
+        auto * rot = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot, nrot);
+        auto * src = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot, 257);
+        auto * dst = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot, 257);
+        auto * ref = llama_mul_mat_hadamard(ctx.get(), src, rot);
+        auto * graph = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(graph, ref);
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+        GGML_ASSERT(buf);
+
+        std::vector<float> matrix(nrot*nrot);
+        const float scale = 1.0f/std::sqrt(float(nrot));
+        for (uint32_t i = 0; i < nrot; ++i) {
+            for (uint32_t j = 0; j < nrot; ++j) {
+                uint32_t bits = i & j;
+                float sign = scale;
+                while (bits) {
+                    sign = -sign;
+                    bits &= bits - 1;
+                }
+                matrix[i*nrot + j] = sign;
+            }
+        }
+        std::vector<float> input(ggml_nelements(src));
+        std::vector<ggml_fp16_t> input_f16(input.size());
+        for (size_t i = 0; i < input.size(); ++i) {
+            input_f16[i] = ggml_fp32_to_fp16(std::sin(float(i)));
+            input[i] = ggml_fp16_to_fp32(input_f16[i]);
+        }
+        ggml_backend_tensor_set(rot, matrix.data(), 0, ggml_nbytes(rot));
+        ggml_backend_tensor_set(src, input.data(), 0, ggml_nbytes(src));
+        GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+
+        llama_io_tensor_converter converter;
+        converter.set_tensor(dst, input_f16.data(), 0, input_f16.size()*sizeof(ggml_fp16_t), { GGML_TYPE_F16, nrot });
+        std::vector<float> expected(input.size()), actual(input.size());
+        ggml_backend_tensor_get(ref, expected.data(), 0, ggml_nbytes(ref));
+        ggml_backend_tensor_get(dst, actual.data(), 0, ggml_nbytes(dst));
+        GGML_ASSERT(nmse(expected, actual) < 1e-10);
+    }
+}
+
+static void test_state_conversion(llm_arch arch, size_t seed, float stdev, ggml_backend_dev_t dev) {
+    auto gguf = get_gguf_ctx(arch, false);
+
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t devices[] = {dev, nullptr};
+    mp.devices = dev ? devices : nullptr;
+    mp.n_gpu_layers = dev ? 999 : 0;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tensor_params, mp));
+    GGML_ASSERT(model);
+
+    std::vector<ggml_type> attention_types;
+    auto make_context = [&](uint32_t n_ctx = 512, bool swa_full = true, uint32_t n_seq_max = 2, ggml_type type = GGML_TYPE_Q8_0) {
+        auto p = llama_context_default_params();
+        p.n_ctx = n_ctx;
+        p.n_batch = 512;
+        p.n_ubatch = 128;
+        p.n_seq_max = n_seq_max;
+        p.kv_unified = true;
+        p.swa_full = swa_full;
+        p.n_threads = p.n_threads_batch = 2;
+        p.type_k = p.type_v = type;
+        p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        p.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask && t->op == GGML_OP_FLASH_ATTN_EXT) {
+                static_cast<std::vector<ggml_type> *>(data)->push_back(t->src[1]->type);
+            }
+            return false;
+        };
+        p.cb_eval_user_data = &attention_types;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), p));
+        GGML_ASSERT(ctx);
+        return ctx;
+    };
+    auto decode = [&](llama_context * ctx, int start, int count, llama_seq_id seq = 0) {
+        attention_types.clear();
+        common_batch b(ctx);
+        for (int i = 0; i < count; ++i) {
+            b.add(1 + (start + i)%100, start + i, seq, i == count - 1);
+        }
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get());
+        GGML_ASSERT(rc == 0);
+        llama_synchronize(ctx);
+        GGML_ASSERT(!attention_types.empty());
+    };
+    auto save = [](llama_context * ctx, llama_state_seq_flags flags = 0) {
+        std::vector<uint8_t> data(llama_state_seq_get_size_ext(ctx, 0, flags));
+        GGML_ASSERT(llama_state_seq_get_data_ext(ctx, data.data(), data.size(), 0, flags) == data.size());
+        return data;
+    };
+    auto restore = [](llama_context * ctx, const std::vector<uint8_t> & data, llama_state_seq_flags flags = 0) {
+        GGML_ASSERT(llama_state_seq_set_data_ext(ctx, data.data(), data.size(), 0, flags) == data.size());
+    };
+    auto src = make_context(512, true, 2, GGML_TYPE_F16);
+    auto ctx = make_context();
+    decode(src.get(), 0, 8);
+    decode(src.get(), 0, 8, 1);
+    decode(src.get(), 8, 8);
+    const auto f16_host = save(src.get());
+    std::vector<uint8_t> f16_full(llama_state_get_size(src.get()));
+    GGML_ASSERT(llama_state_get_data(src.get(), f16_full.data(), f16_full.size()) == f16_full.size());
+    restore(ctx.get(), f16_host);
+    const auto q8_host = save(ctx.get());
+    GGML_ASSERT(llama_state_set_data(ctx.get(), f16_full.data(), f16_full.size()) == f16_full.size());
+    GGML_ASSERT(save(ctx.get()) == q8_host);
+
+    const std::string state_file = "test-kv-conversion-" + std::string(llama_arch_name(arch)) + ".bin";
+    GGML_ASSERT(llama_state_seq_save_file(src.get(), state_file.c_str(), 0, nullptr, 0) > 0);
+    size_t n_tokens = 0;
+    GGML_ASSERT(llama_state_seq_load_file(ctx.get(), state_file.c_str(), 0, nullptr, 0, &n_tokens) > 0);
+    GGML_ASSERT(save(ctx.get()) == q8_host);
+    GGML_ASSERT(std::remove(state_file.c_str()) == 0);
+    LOG_INF("%s: %s passed\n", __func__, llama_arch_name(arch));
+}
+
+#endif
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1918,10 +2049,19 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+#ifdef TEST_KV_CONVERSION
+    bool kv_conversion = false;
+#endif
 
     int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
+#ifdef TEST_KV_CONVERSION
+        if (strcmp(argv[i], "--kv-conversion") == 0) {
+            kv_conversion = true;
+            continue;
+        }
+#endif
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
@@ -2002,6 +2142,18 @@ int main(int argc, char ** argv) {
     init_normal_pool(seed, stdev);
 
     try {
+#ifdef TEST_KV_CONVERSION
+        if (kv_conversion) {
+            auto * dev = target_backend ? ggml_backend_dev_by_name(target_backend) : nullptr;
+            test_kv_rotation(dev);
+            for (auto test_arch : {LLM_ARCH_LLAMA}) {
+                if (arch_matches(arch_filter, test_arch)) {
+                    test_state_conversion(test_arch, seed, stdev, dev);
+                }
+            }
+            return 0;
+        }
+#endif
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
