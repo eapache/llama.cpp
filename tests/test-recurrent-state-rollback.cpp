@@ -126,7 +126,7 @@ static double nmse(const float * a, const float * b, int n) {
 // ubatches while its rollback restore is still pending. Compared against a
 // reference context that never advanced past the rollback point and decodes
 // the identical replay batch.
-static test_status test_multi_seq_split_replay(const common_params & params, llama_model * model, uint8_t fill) {
+static test_status test_multi_seq_split_replay(const common_params & params, llama_model * model, uint8_t fill, bool remove_anchor) {
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
     constexpr uint32_t  n_seqs     = 2;
@@ -174,18 +174,34 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
         return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
     };
 
-    // Keep the anchor at p0 - 1 when rolling back the tail.
+    llama_pos replay_pos[n_seqs] = {};
+
+    // Try removing the anchor as well as the tail when requested.
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         ok = ok && decode_range(ctx_roll.get(), s, 0, (llama_pos) p0 - 1);
         ok = ok && decode_range(ctx_ref.get(),  s, 0, (llama_pos) p0 - 1);
 
         ok = ok && decode_range(ctx_roll.get(), s, (llama_pos) p0 - 1, (llama_pos) n_prompt);
-        ok = ok && decode_range(ctx_ref.get(),  s, (llama_pos) p0 - 1, (llama_pos) p0);
+        if (!ok) {
+            break;
+        }
 
-        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, p0, -1);
+        const llama_pos remove_pos = remove_anchor ? p0 - 1 : p0;
+        const bool removed = llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, remove_pos, -1);
+        if (!removed && !remove_anchor) {
+            ok = false;
+            break;
+        }
+        replay_pos[s] = removed ? remove_pos : (llama_pos) n_prompt;
+        ok = llama_memory_seq_pos_max(llama_get_memory(ctx_roll.get()), (llama_seq_id) s) == replay_pos[s] - 1;
+        if (replay_pos[s] > p0 - 1) {
+            ok = ok && decode_range(ctx_ref.get(), s, p0 - 1, replay_pos[s]);
+        }
 
         // a second partial removal while one is pending must be refused
-        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, p0 - 1, -1);
+        if (removed) {
+            ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, remove_pos - 1, -1);
+        }
     }
     if (!ok) {
         LOG_ERR("%s: multi-seq prefill/rollback failed\n", __func__);
@@ -197,7 +213,7 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
         common_batch batch(ctx);
         for (uint32_t s = 0; s < n_seqs; ++s) {
             for (uint32_t i = 0; i < n_replay; ++i) {
-                const llama_pos pos = p0 + (llama_pos) i;
+                const llama_pos pos = replay_pos[s] + (llama_pos) i;
                 batch.add(tok(s, pos), pos, (llama_seq_id) s, true);
             }
         }
@@ -232,7 +248,7 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
             const float diff = logit_diff(r, f);
             if (diff > 0.0f && pos_first < 0) {
                 seq_first = i/n_replay;
-                pos_first = p0 + (int32_t) (i%n_replay);
+                pos_first = replay_pos[seq_first] + (int32_t) (i%n_replay);
             }
             diff_max = std::max(diff_max, diff);
             if (std::isfinite(r) && std::isfinite(f)) {
@@ -262,7 +278,7 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
     {
         common_batch batch_tail(ctx_ref.get());
         for (uint32_t i = 0; i < n_tail; ++i) {
-            const llama_pos pos = p0 + (llama_pos) (n_replay + i);
+            const llama_pos pos = replay_pos[0] + (llama_pos) (n_replay + i);
             batch_tail.add(tok(0, pos + 7), pos, 0, false);
         }
         ok = llama_process(ctx_ref.get(), LLAMA_PROCESS_TYPE_DECODE, batch_tail.get()) == 0;
@@ -272,7 +288,7 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
     double nmse_tail_ab = 0.0;
     double nmse_tail_a0 = 0.0;
     for (uint32_t i = 0; i < n_tail && ok; ++i) {
-        const llama_pos pos = p0 + (llama_pos) (n_replay + i);
+        const llama_pos pos = replay_pos[1] + (llama_pos) (n_replay + i);
         ok = decode_one(ctx_roll.get(), tok(1, pos), pos, 1);
         ok = ok && decode_one(ctx_ref.get(), tok(1, pos), pos, 1);
         if (!ok) {
@@ -402,22 +418,26 @@ static test_status test_rollback(const common_params & params, llama_model * mod
         return test_status::FAIL;
     }
 
-    // TODO: this test is invalid because RS rollback is only correct once after a ubatch with more than n_rs_seq tokens
-    //       this is not the case here. add asserts and guardrails to prevent such attempts
-    //if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
-    //    !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
-    //    fprintf(stderr, "%s : partial rollback failed\n", __func__);
-    //    return 1;
-    //}
-
-    //constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    //common_prompt_checkpoint ckpt_partial;
-    //ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
-    //ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
-
-    //if (!replay_and_compare("partial")) {
-    //    return 1;
-    //}
+    // A single-token ubatch may not preserve the state before that token.
+    const llama_pos last_pos = n_tokens - 1;
+    if (llama_memory_seq_rm(llama_get_memory(ctx_src.get()), 0, last_pos, -1)) {
+        if (!decode_one(ctx_src.get(), tokens[last_pos], last_pos)) {
+            LOG_ERR("%s: single-token replay failed\n", __func__);
+            return test_status::FAIL;
+        }
+    }
+    if (llama_memory_seq_pos_max(llama_get_memory(ctx_src.get()), 0) != last_pos ||
+        !decode_one(ctx_src.get(), tokens.back(), n_tokens) ||
+        !decode_one(ctx_dst.get(), tokens.back(), n_tokens)) {
+        LOG_ERR("%s: continuation after single-token rollback failed\n", __func__);
+        return test_status::FAIL;
+    }
+    const float * logits_src = llama_get_logits_ith(ctx_src.get(), 0);
+    const float * logits_dst = llama_get_logits_ith(ctx_dst.get(), 0);
+    if (!logits_src || !logits_dst || nmse(logits_src, logits_dst, n_vocab) > nmse_eps) {
+        LOG_ERR("%s: single-token rollback changed the continuation\n", __func__);
+        return test_status::FAIL;
+    }
 
     // Repeat the load into a context that already has its own rollback state:
     // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
@@ -446,6 +466,7 @@ static test_status test_rollback(const common_params & params, llama_model * mod
 
     ckpt.load_tgt(ctx_dirty.get(), 0, 0);
 
+    // FIXME: DSV4 accepts rollback into history not restored by the checkpoint, causing replay logits to differ.
     for (uint32_t i = 0; i < n_rollback; ++i) {
         const llama_pos pos = rollback_pos + i;
         if (!decode_one(ctx_dirty.get(), tokens[pos], pos)) {
@@ -580,12 +601,13 @@ static test_results run_tests(const common_params & params, llama_model * model)
     for (uint8_t fill : { 0, 0x3e }) {
         LOG_INF("%s: testing with cache fill 0x%02x\n", __func__, fill);
         const test_status rb = test_rollback(params, model, fill);
-        const test_status rp = test_multi_seq_split_replay(params, model, fill);
+        const test_status rp = test_multi_seq_split_replay(params, model, fill, false);
+        const test_status ra = test_multi_seq_split_replay(params, model, fill, true);
         const test_status ss = test_shared_seq_reserve(params, model, fill);
         res.rollback = merge_status(res.rollback, rb);
-        res.replay   = merge_status(res.replay,   rp);
+        res.replay   = merge_status(res.replay, merge_status(rp, ra));
         res.shared   = merge_status(res.shared,   ss);
-        if (rb == test_status::FAIL || rp == test_status::FAIL || ss == test_status::FAIL) {
+        if (rb == test_status::FAIL || rp == test_status::FAIL || ra == test_status::FAIL || ss == test_status::FAIL) {
             break;
         }
     }
