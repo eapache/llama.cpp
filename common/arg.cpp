@@ -300,6 +300,12 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
+void common_parse_cache_type(const std::string & value, ggml_type & initial, ggml_type & target) {
+    const auto sep = value.find(':');
+    initial = sep == std::string::npos ? GGML_TYPE_COUNT : kv_cache_type_from_str(value.substr(0, sep));
+    target = kv_cache_type_from_str(sep == std::string::npos ? value : value.substr(sep + 1));
+}
+
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
@@ -2418,29 +2424,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
-        {"-ctk", "--cache-type-k"}, "TYPE",
+        {"-ctk", "--cache-type-k"}, "TYPE[:TYPE]",
         string_format(
-            "KV cache data type for K\n"
+            "KV cache data type for K, or INITIAL:FINAL to switch to a smaller type when full (e.g. q8_0:q4_0)\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            common_parse_cache_type(value, params.cache_type_k_initial, params.cache_type_k);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
-        {"-ctv", "--cache-type-v"}, "TYPE",
+        {"-ctv", "--cache-type-v"}, "TYPE[:TYPE]",
         string_format(
-            "KV cache data type for V\n"
+            "KV cache data type for V, or INITIAL:FINAL to switch to a smaller type when full (e.g. q8_0:q4_0)\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_v = kv_cache_type_from_str(value);
+            common_parse_cache_type(value, params.cache_type_v_initial, params.cache_type_v);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -4150,29 +4156,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
+        {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE[:TYPE]",
         string_format(
-            "KV cache data type for K for the draft model\n"
+            "KV cache data type for K for the draft model, or INITIAL:FINAL to switch to a smaller type when full (e.g. q8_0:q4_0)\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            common_parse_cache_type(value, params.speculative.draft.cache_type_k_initial, params.speculative.draft.cache_type_k);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
-        {"--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}, "TYPE",
+        {"--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}, "TYPE[:TYPE]",
         string_format(
-            "KV cache data type for V for the draft model\n"
+            "KV cache data type for V for the draft model, or INITIAL:FINAL to switch to a smaller type when full (e.g. q8_0:q4_0)\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            common_parse_cache_type(value, params.speculative.draft.cache_type_v_initial, params.speculative.draft.cache_type_v);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(

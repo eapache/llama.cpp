@@ -39,6 +39,8 @@ int main(int argc, char ** argv) {
         params.cache_type_v = GGML_TYPE_F32;
     }
 
+    params.cache_type_k_initial = params.cache_type_v_initial = GGML_TYPE_COUNT;
+
     llama_backend_init();
     llama_numa_init(params.numa);
     // load the model and apply lora adapter, if any

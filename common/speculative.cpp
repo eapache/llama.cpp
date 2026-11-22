@@ -3056,6 +3056,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    result.cache_type_k_initial = params_spec.cache_type_k_initial;
+    result.cache_type_v_initial = params_spec.cache_type_v_initial;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

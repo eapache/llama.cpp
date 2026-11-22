@@ -54,8 +54,8 @@ test parameters:
   -d, --n-depth <n>                         (default: 0)
   -b, --batch-size <n>                      (default: 2048)
   -ub, --ubatch-size <n>                    (default: 512)
-  -ctk, --cache-type-k <t>                  (default: f16)
-  -ctv, --cache-type-v <t>                  (default: f16)
+  -ctk, --cache-type-k <t[:t]>              (default: f16)
+  -ctv, --cache-type-v <t[:t]>              (default: f16)
   -t, --threads <n>                         (default: system dependent)
   -C, --cpu-mask <hex,hex>                  (default: 0x0)
   --cpu-strict <0|1>                        (default: 0)
@@ -94,6 +94,8 @@ With the exception of `-r`, `-o` and `-v`, all options can be specified multiple
 Each test is repeated the number of times given by `-r`, and the results are averaged. The results are given in average tokens per second (t/s) and standard deviation. Some output formats (e.g. json) also include the individual results of each repetition.
 
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
+
+Use `-ctk f16:q8_0` to start K in F16 and convert it to Q8_0 when a batch needs more cells. Set `-ctv` independently. Both share the initial cell limit and use the memory allocated for their final types. Lazy conversion requires flash attention and one KV stream. FP8 is supported as a fixed type only.
 
 For a description of the other options, see the [completion example](../completion/README.md).
 

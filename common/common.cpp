@@ -1775,6 +1775,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.type_k_initial = params.cache_type_k_initial;
+    cparams.type_v_initial = params.cache_type_v_initial;
+    cparams.kv_lazy = cparams.type_k_initial != GGML_TYPE_COUNT || cparams.type_v_initial != GGML_TYPE_COUNT;
 
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;

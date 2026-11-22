@@ -257,6 +257,23 @@ static void test(void) {
     assert(params.model.path == "model_file.gguf");
 
     {
+        common_params cache;
+        argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "q8_0:q4_0", "-ctv", "f16:q8_0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache, LLAMA_EXAMPLE_COMMON));
+        auto cp = common_context_params_to_llama(cache);
+        assert(cp.kv_lazy);
+        assert(cp.type_k_initial == GGML_TYPE_Q8_0 && cp.type_k == GGML_TYPE_Q4_0);
+        assert(cp.type_v_initial == GGML_TYPE_F16 && cp.type_v == GGML_TYPE_Q8_0);
+        argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "f16"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache, LLAMA_EXAMPLE_COMMON));
+        assert(cache.cache_type_k_initial == GGML_TYPE_COUNT && cache.cache_type_k == GGML_TYPE_F16);
+        for (const auto * invalid : {":q8_0", "q8_0:", "f16:q8_0:q4_0"}) {
+            argv = {"binary_name", "-m", "model_file.gguf", "-ctk", invalid};
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), cache, LLAMA_EXAMPLE_COMMON));
+        }
+    }
+
+    {
         auto parse_shards = [&list_str_to_char](std::vector<std::string> args) {
             common_params shard_params;
             args.insert(args.begin(), {"binary_name", "-m", "model_file.gguf"});

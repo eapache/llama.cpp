@@ -140,6 +140,9 @@ int main(int argc, char ** argv) {
     ctx_params.no_perf              = params.no_perf;
     ctx_params.type_k               = params.cache_type_k;
     ctx_params.type_v               = params.cache_type_v;
+    ctx_params.type_k_initial = params.cache_type_k_initial;
+    ctx_params.type_v_initial = params.cache_type_v_initial;
+    ctx_params.kv_lazy = ctx_params.type_k_initial != GGML_TYPE_COUNT || ctx_params.type_v_initial != GGML_TYPE_COUNT;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {

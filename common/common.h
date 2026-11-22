@@ -363,6 +363,8 @@ struct common_params_speculative_draft {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k_initial = GGML_TYPE_COUNT;
+    ggml_type cache_type_v_initial = GGML_TYPE_COUNT;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -615,6 +617,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k_initial = GGML_TYPE_COUNT;
+    ggml_type cache_type_v_initial = GGML_TYPE_COUNT;
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
