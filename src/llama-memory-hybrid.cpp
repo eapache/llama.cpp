@@ -137,6 +137,10 @@ bool llama_memory_hybrid::try_lazy_quantize(llama_context * lctx) {
     return mem_attn->try_lazy_quantize(lctx);
 }
 
+void llama_memory_hybrid::get_lazy_caches(std::vector<llama_kv_cache *> & caches) {
+    mem_attn->get_lazy_caches(caches);
+}
+
 bool llama_memory_hybrid::get_has_lazy_quant() const {
     return mem_attn->get_has_lazy_quant();
 }

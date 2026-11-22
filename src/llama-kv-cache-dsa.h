@@ -49,6 +49,8 @@ public:
 
     bool get_has_lazy_quant() const override;
 
+    void get_lazy_caches(std::vector<llama_kv_cache *> & caches) override;
+
     bool get_needs_lazy_quant() const;
 
     bool get_can_shift() const override;

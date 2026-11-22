@@ -234,6 +234,11 @@ bool llama_kv_cache_dsa_iswa::try_lazy_quantize(llama_context * lctx) {
     return dsa || swa;
 }
 
+void llama_kv_cache_dsa_iswa::get_lazy_caches(std::vector<llama_kv_cache *> & caches) {
+    kv_dsa->get_lazy_caches(caches);
+    kv_swa->get_lazy_caches(caches);
+}
+
 bool llama_kv_cache_dsa_iswa::get_has_lazy_quant() const {
     return kv_dsa->get_has_lazy_quant() || kv_swa->get_has_lazy_quant();
 }

@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -550,6 +551,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (memory && memory->get_has_lazy_quant()) {
+            memory->get_lazy_caches(lazy_caches);
+        }
     }
 
     // init backends
@@ -1032,6 +1036,26 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+void llama_context::reset_empty_lazy_caches() {
+    if (lazy_caches.empty() || std::any_of(lazy_caches.begin(), lazy_caches.end(), [](const llama_kv_cache * kv) {
+        return !kv->can_reset_lazy_quant();
+    })) {
+        return;
+    }
+
+    bool synced = false;
+    for (auto * kv : lazy_caches) {
+        if (!kv->get_has_lazy_quant()) {
+            if (!synced) {
+                synchronize();
+                synced = true;
+            }
+            kv->reset_lazy_quant();
+            sched_need_reserve = true;
+        }
+    }
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -2251,6 +2275,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    reset_empty_lazy_caches();
     sched_reserve();
 
     bool did_optimize = false;
@@ -4126,6 +4151,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
 
         // A partial or failed restore can change only part of the cache layout.
+        reset_empty_lazy_caches();
         sched_need_reserve = sched_need_reserve || memory->get_has_lazy_quant();
         memory->state_read(io);
     }
@@ -4143,6 +4169,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
+        reset_empty_lazy_caches();
         sched_need_reserve = sched_need_reserve || memory->get_has_lazy_quant();
         memory->state_read(io, seq_id, flags);
     }

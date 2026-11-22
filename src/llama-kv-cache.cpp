@@ -320,22 +320,22 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
-        std::vector<ggml_tensor *> k_stream_target;
-        std::vector<ggml_tensor *> v_stream_target;
+        std::vector<ggml_tensor *> k_stream_alt;
+        std::vector<ggml_tensor *> v_stream_alt;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
 
             if (lazy_quant) {
-                k_stream_target.push_back(has_k ? ggml_view_2d(ctx, k_target, n_embd_k_gqa, target.size, k_target->nb[1], s*k_target->nb[2]) : nullptr);
-                v_stream_target.push_back(has_v ? ggml_view_2d(ctx, v_target, n_embd_v_gqa, target.size, v_target->nb[1], s*v_target->nb[2]) : nullptr);
+                k_stream_alt.push_back(has_k ? ggml_view_2d(ctx, k_target, n_embd_k_gqa, target.size, k_target->nb[1], s*k_target->nb[2]) : nullptr);
+                v_stream_alt.push_back(has_v ? ggml_view_2d(ctx, v_target, n_embd_v_gqa, target.size, v_target->nb[1], s*v_target->nb[2]) : nullptr);
             }
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, model.layers[il].k_cache_s, model.layers[il].v_cache_s, k_target, v_target, k_stream, v_stream, k_stream_target, v_stream_target, });
+        layers.push_back({ il, k, v, model.layers[il].k_cache_s, model.layers[il].v_cache_s, k_target, v_target, k_stream, v_stream, k_stream_alt, v_stream_alt, k, v, });
     }
 
     if (reuse) {
@@ -441,6 +441,7 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    initial = current;
     init_rotation(name_tag);
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
@@ -913,8 +914,8 @@ bool llama_kv_cache::try_lazy_quantize(llama_context * lctx) {
         layer.k = layer.k_target;
         layer.v = layer.v_target;
 
-        layer.k_stream = std::move(layer.k_stream_target);
-        layer.v_stream = std::move(layer.v_stream_target);
+        layer.k_stream.swap(layer.k_stream_alt);
+        layer.v_stream.swap(layer.v_stream_alt);
     }
 
     v_cells[0].grow(target.size);
@@ -927,8 +928,37 @@ bool llama_kv_cache::try_lazy_quantize(llama_context * lctx) {
     return true;
 }
 
+void llama_kv_cache::get_lazy_caches(std::vector<llama_kv_cache *> & caches) {
+    if (initial.size != target.size) {
+        caches.push_back(this);
+    }
+}
+
 bool llama_kv_cache::get_has_lazy_quant() const {
     return current.size != target.size;
+}
+
+bool llama_kv_cache::can_reset_lazy_quant() const {
+    // A sharing context holds views of the target tensors.
+    return v_cells_impl.use_count() == 1 && v_cells[0].get_used() == 0;
+}
+
+void llama_kv_cache::reset_lazy_quant() {
+    GGML_ASSERT(can_reset_lazy_quant() && initial.size != current.size);
+    for (auto & layer : layers) {
+        layer.k = layer.k_initial;
+        layer.v = layer.v_initial;
+        layer.k_stream.swap(layer.k_stream_alt);
+        layer.v_stream.swap(layer.v_stream_alt);
+    }
+    current = initial;
+    v_cells[0].resize(current.size);
+    v_heads[0] = 0;
+    lazy_quant_pending = false;
+    // Quantized bytes can read as NaNs in unused rows of the initial views.
+    for (auto & [_, buf] : ctxs_bufs) {
+        ggml_backend_buffer_clear(buf.get(), 0);
+    }
 }
 
 bool llama_kv_cache::get_needs_lazy_quant() const {

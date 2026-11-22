@@ -11,6 +11,7 @@
 struct llama_ubatch;
 
 class llama_batch_allocr;
+class llama_kv_cache;
 
 class llama_io_write_i;
 class llama_io_read_i;
@@ -146,6 +147,10 @@ struct llama_memory_i {
 
     virtual bool get_has_lazy_quant() const {
         return false;
+    }
+
+    virtual void get_lazy_caches(std::vector<llama_kv_cache *> & caches) {
+        GGML_UNUSED(caches);
     }
 
     // getters

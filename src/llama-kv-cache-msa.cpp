@@ -158,6 +158,11 @@ bool llama_kv_cache_msa::try_lazy_quantize(llama_context * lctx) {
     return base || idx;
 }
 
+void llama_kv_cache_msa::get_lazy_caches(std::vector<llama_kv_cache *> & caches) {
+    kv_base->get_lazy_caches(caches);
+    kv_idx->get_lazy_caches(caches);
+}
+
 bool llama_kv_cache_msa::get_has_lazy_quant() const {
     return kv_base->get_has_lazy_quant() || kv_idx->get_has_lazy_quant();
 }

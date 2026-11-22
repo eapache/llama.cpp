@@ -137,7 +137,11 @@ public:
 
     bool get_has_lazy_quant() const override;
 
+    void get_lazy_caches(std::vector<llama_kv_cache *> & caches) override;
+
     bool get_needs_lazy_quant() const;
+    bool can_reset_lazy_quant() const;
+    void reset_lazy_quant();
 
     bool get_can_shift() const override;
 
@@ -288,8 +292,10 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
-        std::vector<ggml_tensor *> k_stream_target;
-        std::vector<ggml_tensor *> v_stream_target;
+        std::vector<ggml_tensor *> k_stream_alt;
+        std::vector<ggml_tensor *> v_stream_alt;
+        ggml_tensor * k_initial = nullptr;
+        ggml_tensor * v_initial = nullptr;
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
     };
@@ -307,6 +313,7 @@ private:
         uint32_t n_rot_v = 0;
     };
 
+    cache_format initial;
     cache_format current;
     cache_format target;
     bool lazy_quant_pending = false;

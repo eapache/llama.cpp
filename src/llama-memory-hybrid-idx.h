@@ -61,6 +61,8 @@ public:
 
     bool get_has_lazy_quant() const override;
 
+    void get_lazy_caches(std::vector<llama_kv_cache *> & caches) override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

@@ -2136,13 +2136,29 @@ static void test_lazy_kv(llm_arch arch, size_t seed, float stdev, ggml_backend_d
     GGML_ASSERT(llama_memory_seq_pos_max(ctx->get_memory(), 1) == 249);
     GGML_ASSERT(save(ctx.get()) == q8_host);
 
+    // Removing one sequence must preserve the other sequence's format.
+    GGML_ASSERT(llama_memory_seq_rm(ctx->get_memory(), 1, -1, -1));
+    decode(ctx.get(), 16, 1);
+    check_type(GGML_TYPE_Q8_0);
+    GGML_ASSERT(llama_memory_seq_rm(ctx->get_memory(), 0, -1, -1));
+    decode(ctx.get(), 0, 16);
+    check_type(GGML_TYPE_F16);
+    decode(ctx.get(), 16, 241);
+    check_type(GGML_TYPE_Q8_0);
+    llama_memory_clear(ctx->get_memory(), false);
+    restore(ctx.get(), f16_host);
+    GGML_ASSERT(save(ctx.get()) == f16_host);
+    decode(ctx.get(), 16, 1);
+    check_type(GGML_TYPE_F16);
+
     // A truncated restore must invalidate the graph even when the read throws.
     ctx = make_context();
     decode(ctx.get(), 0, 1);
     GGML_ASSERT(llama_state_seq_set_data(ctx.get(), q8_host.data(), q8_host.size() - 1, 0) == 0);
     GGML_ASSERT(!ctx->get_memory()->get_has_lazy_quant());
     decode(ctx.get(), 0, 1);
-    check_type(GGML_TYPE_Q8_0);
+    // A failed SWA restore can leave valid rows in the base cache.
+    check_type(arch == LLM_ARCH_GEMMA4 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16);
 
     if (arch == LLM_ARCH_GEMMA4) {
         // SWA fills first; full attention must remain F16 until it also fills.

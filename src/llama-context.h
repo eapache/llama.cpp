@@ -25,6 +25,7 @@ class llama_io_write_i;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
+class llama_kv_cache;
 struct llama_memory_context_i;
 
 // stores copy of the memory in device buffer. used for fast state save/load
@@ -344,6 +345,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    std::vector<llama_kv_cache *> lazy_caches;
+
+    void reset_empty_lazy_caches();
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
