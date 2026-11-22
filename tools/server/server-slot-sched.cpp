@@ -1,4 +1,5 @@
 #include "server-slot-sched.h"
+#include "../../src/llama-ext.h"
 
 #include "common.h"
 #include "llama.h"
@@ -81,12 +82,12 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, bool lazy_initial) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
+        if (it->lazy_initial == lazy_initial && cur_lcp_len == (int) prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -111,7 +112,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
+        if (it->lazy_initial == lazy_initial && len == (int) it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -159,6 +160,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.lazy_initial =*/ lazy_initial,
     });
 
     return &states.back();
@@ -175,6 +177,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+    bool initial_best = llama_kv_is_lazy_initial(ctx_tgt);
     auto it_best = states.end();
 
     // find the most similar cached prompt, that would also preserve the most context
@@ -196,7 +199,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        bool better = f_keep_best < f_keep_cur && f_sim_best < f_sim_cur;
+        if (it->lazy_initial != initial_best) {
+            // Across formats, prefer more matching tokens, then the initial precision.
+            better = lcp_cur > lcp_best || (lcp_cur == lcp_best && lcp_cur > 0 && it->lazy_initial);
+        }
+        if (better) {
+            initial_best = it->lazy_initial;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
             lcp_best    = lcp_cur;
@@ -210,8 +219,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         const int64_t t_start = ggml_time_us();
 
+        // Release the replaced sequence so an empty cache can restore the initial precision.
+        if (it_best->lazy_initial && !llama_kv_is_lazy_initial(ctx_tgt)) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+        }
+
         {
-            auto & data = it_best->data.main;
+            const auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -220,13 +234,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = it_best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -238,9 +249,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
@@ -251,9 +259,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
         }
 
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
+        if (it_best->lazy_initial) {
+            prompt = it_best->prompt.clone();
+            states.splice(states.end(), states, it_best);
+        } else {
+            prompt = std::move(it_best->prompt);
+            states.erase(it_best);
+        }
 
         SRV_TRC("slot %d: prompt cache restore took %.2f ms\n", id_slot, (ggml_time_us() - t_start) / 1000.0);
     }

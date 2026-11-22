@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "../../src/llama-ext.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -363,7 +364,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, llama_kv_is_lazy_initial(ctx_tgt));
         if (cur == nullptr) {
             return false;
         }
@@ -1850,6 +1851,23 @@ private:
         SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
     }
 
+    void cache_idle_slots(const server_slot & selected) {
+        for (auto & slot : slots) {
+            if (&slot == &selected || slot.is_processing() || slot.prompt.tokens.empty()) {
+                continue;
+            }
+            SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+            if (slot.prompt_save(*prompt_cache)) {
+                SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                prompt_cache->update();
+            }
+            if (params_base.kv_unified) {
+                // [TAG_IDLE_SLOT_CLEAR]
+                slot.prompt_clear();
+            }
+        }
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
@@ -3017,6 +3035,12 @@ private:
                     }
 
                     // the task is not deferred past this point
+                    // Release idle sequences before a restore that can switch the shared pool back to its initial format.
+                    const bool cache_idle_first = plan.update_cache && params_base.cache_idle_slots && params_base.kv_unified &&
+                            (params_base.cache_type_k_initial != GGML_TYPE_COUNT || params_base.cache_type_v_initial != GGML_TYPE_COUNT);
+                    if (cache_idle_first) {
+                        cache_idle_slots(*slot);
+                    }
                     if (plan.update_cache && prompt_cache) {
                         update_prompt_cache(*slot, task);
                     }
@@ -3031,22 +3055,8 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
-                            }
-                        }
+                    if (params_base.cache_idle_slots && !cache_idle_first) {
+                        cache_idle_slots(*slot);
                     }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:

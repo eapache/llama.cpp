@@ -76,6 +76,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    bool kv_is_lazy_initial() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);

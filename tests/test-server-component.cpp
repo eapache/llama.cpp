@@ -335,6 +335,27 @@ static void test_json_helpers(testing & t) {
 // server_prompt
 //
 
+static void test_prompt_cache_lazy_prefix(testing & t) {
+    server_prompt_cache cache(1, 100);
+    server_prompt prompt;
+    prompt.tokens = server_tokens({1, 2}, false);
+    t.assert_true("save initial prefix", cache.alloc(prompt, 8, 0, true));
+    prompt.tokens.push_back(3);
+    t.assert_true("replace shorter initial prefix", cache.alloc(prompt, 12, 0, true));
+    t.assert_equal("one initial snapshot", size_t(1), cache.states.size());
+    prompt.tokens.push_back(4);
+    t.assert_true("save converted continuation", cache.alloc(prompt, 8, 0, false));
+    t.assert_equal("keep initial prefix", size_t(2), cache.states.size());
+    t.assert_true("prefix still initial", cache.states.front().lazy_initial);
+    t.assert_equal("longest initial prefix", 3, cache.states.front().prompt.n_tokens());
+
+    server_prompt_cache reverse(1, 100);
+    t.assert_true("cache converted first", reverse.alloc(prompt, 8, 0, false));
+    prompt.tokens = server_tokens({1, 2, 3}, false);
+    t.assert_true("save initial prefix later", reverse.alloc(prompt, 12, 0, true));
+    t.assert_true("skip duplicate initial prefix", !reverse.alloc(prompt, 12, 0, true));
+}
+
 static void test_server_prompt_reuse(testing & t) {
     // 110 text tokens, the position of a token is its index
     auto make_prompt = [](std::vector<std::array<llama_pos, 2>> checkpoints) {
@@ -953,6 +974,7 @@ int main(int argc, char ** argv) {
     t.test("sse",           test_sse);
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
+    t.test("prompt_cache_lazy_prefix", test_prompt_cache_lazy_prefix);
     t.test("server_prompt_reuse", test_server_prompt_reuse);
     t.test("server_pipe",   test_server_pipe);
     t.test("decision_escape", test_decision_escape);

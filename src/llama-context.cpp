@@ -1038,6 +1038,16 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
+bool llama_context::kv_is_lazy_initial() const {
+    return !lazy_caches.empty() && std::all_of(lazy_caches.begin(), lazy_caches.end(), [](const llama_kv_cache * kv) {
+        return kv->get_has_lazy_quant();
+    });
+}
+
+bool llama_kv_is_lazy_initial(const llama_context * ctx) {
+    return ctx && ctx->kv_is_lazy_initial();
+}
+
 void llama_context::reset_empty_lazy_caches() {
     if (lazy_caches.empty() || std::any_of(lazy_caches.begin(), lazy_caches.end(), [](const llama_kv_cache * kv) {
         return !kv->can_reset_lazy_quant();
