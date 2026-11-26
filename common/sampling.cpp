@@ -751,8 +751,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
-    std::vector<llama_token_data> residual;
-
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
     size_t i = 0;
@@ -760,7 +758,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
         const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
@@ -792,13 +790,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // q_x is never 0 for a token the draft produced, but guard the divide
         const float q_x = prob_of(q.data(), q.size(), draft[i]);
 
-        float p_x = 0.0f;
-        for (size_t k = 0; k < cur_p->size; ++k) {
-            if (cur_p->data[k].id == draft[i]) {
-                p_x = p_of(k);
-                break;
+        size_t idx = (size_t) draft[i];
+        if (idx >= cur_p->size || cur_p->data[idx].id != draft[i]) {
+            idx = 0;
+            while (idx < cur_p->size && cur_p->data[idx].id != draft[i]) {
+                ++idx;
             }
         }
+        const float p_x = idx < cur_p->size ? p_of(idx) : 0.0f;
 
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
@@ -807,25 +806,37 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         }
 
         // rejected: tokens outside q's support keep all of p
-        residual.clear();
-        float sum = 0.0f;
-        for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
-            if (r > 0.0f) {
-                residual.push_back({ cur_p->data[k].id, 0.0f, r });
-                sum += r;
+        const bool small = cur_p->size <= 64 && q.size() <= 64;
+        std::vector<float> residual(small ? cur_p->size : llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))));
+        if (!small) {
+            for (const auto & e : q) {
+                if ((size_t) e.id < residual.size()) {
+                    residual[e.id] = e.p;
+                }
             }
         }
 
+        // Small lists use candidate order. For larger lists, each target token replaces its own draft probability.
+        double sum = 0.0;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const llama_token id = cur_p->data[k].id;
+            float & r = residual[small ? k : (size_t) id];
+            const float q_k = small ? prob_of(q.data(), q.size(), id) : r;
+            r = std::max(0.0f, p_of(k) - q_k);
+            sum += r;
+        }
+
         llama_token id = id_tgt;
-        if (sum > 0.0f) {
-            float u = uni(gsmpl->rng) * sum;
-            id = residual.back().id;
-            for (const auto & e : residual) {
-                u -= e.p;
-                if (u <= 0.0f) {
-                    id = e.id;
-                    break;
+        if (sum > 0.0) {
+            double u = uni(gsmpl->rng) * sum;
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                const float r = residual[small ? k : (size_t) cur_p->data[k].id];
+                if (r > 0.0f) {
+                    id = cur_p->data[k].id;
+                    u -= r;
+                    if (u <= 0.0) {
+                        break;
+                    }
                 }
             }
         }

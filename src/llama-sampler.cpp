@@ -1177,9 +1177,13 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // max logit for numerical stability
     float max_l = cur_p->data[0].logit;
     if (!cur_p->sorted) {
-        for (size_t i = 1; i < cur_p->size; ++i) {
-            max_l = std::max(max_l, cur_p->data[i].logit);
+        // Independent maxima keep a long vocabulary scan off a single dependency chain.
+        float max_odd = std::max(max_l, cur_p->data[cur_p->size - 1].logit);
+        for (size_t i = 1; i < cur_p->size; i += 2) {
+            max_l   = std::max(max_l,   cur_p->data[i - 1].logit);
+            max_odd = std::max(max_odd, cur_p->data[i].logit);
         }
+        max_l = std::max(max_l, max_odd);
     }
 
     // apply softmax to obtain the probabilities
@@ -1198,6 +1202,7 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
 
           double sum_run = 0.0f;
     const double sum_tgt = sum_cum*rnd;
+    const double inv_sum = 1.0/sum_cum;
 
     bool found = false;
     for (size_t i = 0; i < cur_p->size; ++i) {
@@ -1211,7 +1216,7 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         }
 
         // normalize probs
-        cur_p->data[i].p /= sum_cum;
+        cur_p->data[i].p *= inv_sum;
     }
 
     // fallback to the last token (don't think this can happen)
